@@ -36,6 +36,8 @@ pub enum Key {
     Down,
     /// Tab key
     Tab,
+    /// Backtab key
+    BackTab,
     /// Delete key
     Delete,
     /// Home key

@@ -1,4 +1,4 @@
-use crate::cursor::CursorMove;
+use crate::cursor::{fit_col, CursorMove};
 use crate::highlight::LineHighlighter;
 use crate::history::{Edit, EditKind, History};
 use crate::input::{Input, Key};
@@ -124,6 +124,8 @@ pub struct TextArea<'a> {
     pub(crate) placeholder_style: Style,
     mask: Option<char>,
     selection_start: Option<(usize, usize)>,
+    line_selection_start: Option<usize>,
+    desired_col: usize,
     select_style: Style,
 }
 
@@ -229,6 +231,8 @@ impl<'a> TextArea<'a> {
             placeholder_style: Style::default().fg(Color::DarkGray),
             mask: None,
             selection_start: None,
+            line_selection_start: None,
+            desired_col: 0,
             select_style: Style::default().bg(Color::LightBlue),
         }
     }
@@ -1335,6 +1339,11 @@ impl<'a> TextArea<'a> {
         self.selection_start = Some(self.cursor);
     }
 
+    pub fn start_line_selection(&mut self) {
+        let (row, _) = self.cursor;
+        self.line_selection_start = Some(row);
+    }
+
     /// Stop the current text selection. This method does nothing if text selection is not ongoing.
     /// ```
     /// use tui_textarea::{TextArea, CursorMove};
@@ -1353,6 +1362,7 @@ impl<'a> TextArea<'a> {
     /// ```
     pub fn cancel_selection(&mut self) {
         self.selection_start = None;
+        self.line_selection_start = None;
     }
 
     /// Select the entire text. Cursor moves to the end of the text buffer. When text selection is already ongoing,
@@ -1388,7 +1398,7 @@ impl<'a> TextArea<'a> {
     /// assert!(!textarea.is_selecting());
     /// ```
     pub fn is_selecting(&self) -> bool {
-        self.selection_start.is_some()
+        self.selection_start.is_some() | self.line_selection_start.is_some()
     }
 
     fn line_offset(&self, row: usize, col: usize) -> usize {
@@ -1400,6 +1410,14 @@ impl<'a> TextArea<'a> {
             .nth(col)
             .map(|(i, _)| i)
             .unwrap_or(line.len())
+    }
+
+    pub fn set_desired_column(&mut self, col: usize) {
+        self.desired_col = col;
+    }
+
+    pub fn get_desired_column(&self) -> usize {
+        self.desired_col
     }
 
     /// Set the style used for text selection. The default style is light blue.
@@ -1431,15 +1449,32 @@ impl<'a> TextArea<'a> {
     }
 
     fn selection_positions(&self) -> Option<(Pos, Pos)> {
-        let (sr, sc) = self.selection_start?;
-        let (er, ec) = self.cursor;
-        let (so, eo) = (self.line_offset(sr, sc), self.line_offset(er, ec));
-        let s = Pos::new(sr, sc, so);
-        let e = Pos::new(er, ec, eo);
-        match (sr, so).cmp(&(er, eo)) {
-            Ordering::Less => Some((s, e)),
-            Ordering::Equal => None,
-            Ordering::Greater => Some((e, s)),
+        if let Some(start_row) = self.line_selection_start {
+            let ((sr, sc), (er, ec)) = if self.cursor.0 >= start_row {
+                ((start_row, 0), (self.cursor.0 + 1, 0))
+            } else {
+                ((self.cursor.0, 0), (start_row + 1, 0))
+            };
+            let (so, eo) = (self.line_offset(sr, sc), self.line_offset(er, ec));
+            let s = Pos::new(sr, sc, so);
+            let e = Pos::new(er, ec, eo);
+            match (sr, so).cmp(&(er, eo)) {
+                Ordering::Less => Some((s, e)),
+                Ordering::Equal => None,
+                Ordering::Greater => Some((e, s)),
+            }
+        } else if let Some((sr, sc)) = self.selection_start {
+            let (er, ec) = self.cursor;
+            let (so, eo) = (self.line_offset(sr, sc), self.line_offset(er, ec));
+            let s = Pos::new(sr, sc, so);
+            let e = Pos::new(er, ec, eo);
+            match (sr, so).cmp(&(er, eo)) {
+                Ordering::Less => Some((s, e)),
+                Ordering::Equal => None,
+                Ordering::Greater => Some((e, s)),
+            }
+        } else {
+            return None;
         }
     }
 
@@ -1526,19 +1561,53 @@ impl<'a> TextArea<'a> {
     /// assert_eq!(textarea.cursor(), (1, 1));
     /// ```
     pub fn move_cursor(&mut self, m: CursorMove) {
-        self.move_cursor_with_shift(m, self.selection_start.is_some());
+        self.move_cursor_with_shift(
+            m,
+            self.selection_start.is_some() | self.line_selection_start.is_some(),
+        );
     }
 
     fn move_cursor_with_shift(&mut self, m: CursorMove, shift: bool) {
         if let Some(cursor) = m.next_cursor(self.cursor, &self.lines, &self.viewport) {
-            if shift {
-                if self.selection_start.is_none() {
-                    self.start_selection();
+            if let Some(_) = self.line_selection_start {
+                if !shift {
+                    self.cancel_selection();
                 }
-            } else {
-                self.cancel_selection();
+            } else if let Some(_) = self.selection_start {
+                // Regular character selection is currently active
+                if !shift {
+                    self.cancel_selection();
+                }
+            } else if shift {
+                self.start_selection();
             }
-            self.cursor = cursor;
+
+            match m {
+                CursorMove::Back
+                | CursorMove::Left
+                | CursorMove::Forward
+                | CursorMove::Right
+                | CursorMove::End
+                | CursorMove::Head
+                | CursorMove::WordBack
+                | CursorMove::WordForward
+                | CursorMove::WordEnd
+                | CursorMove::Jump(_, _)
+                | CursorMove::InViewport => {
+                    self.desired_col = cursor.1;
+                    self.cursor = cursor;
+                }
+                CursorMove::Up
+                | CursorMove::Down
+                | CursorMove::Top
+                | CursorMove::Bottom
+                | CursorMove::ParagraphForward
+                | CursorMove::ParagraphBack => {
+                    let row = cursor.0;
+                    let col = fit_col(self.desired_col, &self.lines[cursor.0]);
+                    self.cursor = (row, col);
+                }
+            }
         }
     }
 
@@ -2429,5 +2498,118 @@ mod tests {
         assert_eq!(textarea.cursor(), (15, 0));
         textarea.scroll((-5, 0));
         assert_eq!(textarea.cursor(), (12, 0));
+    }
+
+    #[test]
+    fn line_selection_with_cursor_movement() {
+        let mut textarea = TextArea::from(["line1", "line2", "line3", "line4"]);
+
+        // Start at line 1
+        textarea.move_cursor(CursorMove::Down);
+        assert_eq!(textarea.cursor(), (1, 0));
+
+        // Start line selection with shift+down
+        textarea.move_cursor_with_shift(CursorMove::Down, true);
+        assert_eq!(textarea.cursor(), (2, 0));
+        assert!(textarea.line_selection_start.is_some());
+        assert_eq!(textarea.line_selection_start, Some(1));
+
+        // Extend line selection with shift+down
+        textarea.move_cursor_with_shift(CursorMove::Down, true);
+        assert_eq!(textarea.cursor(), (3, 0));
+        assert!(textarea.line_selection_start.is_some());
+        assert_eq!(textarea.line_selection_start, Some(1));
+
+        // Contract line selection with shift+up
+        textarea.move_cursor_with_shift(CursorMove::Up, true);
+        assert_eq!(textarea.cursor(), (2, 0));
+        assert!(textarea.line_selection_start.is_some());
+        assert_eq!(textarea.line_selection_start, Some(1));
+
+        // Cancel line selection with movement without shift
+        textarea.move_cursor_with_shift(CursorMove::Down, false);
+        assert_eq!(textarea.cursor(), (3, 0));
+        assert!(textarea.line_selection_start.is_none());
+    }
+
+    #[test]
+    fn line_selection_cancelled_by_horizontal_movement() {
+        let mut textarea = TextArea::from(["line1", "line2", "line3"]);
+
+        // Start line selection
+        textarea.start_line_selection();
+        assert!(textarea.line_selection_start.is_some());
+
+        // Horizontal movement should cancel line selection
+        textarea.move_cursor_with_shift(CursorMove::Forward, true);
+        assert!(textarea.line_selection_start.is_none());
+        assert!(textarea.selection_start.is_some()); // Should start character selection instead
+
+        // Reset
+        textarea.cancel_selection();
+        textarea.start_line_selection();
+        assert!(textarea.line_selection_start.is_some());
+
+        // Test other horizontal movements
+        textarea.move_cursor_with_shift(CursorMove::Back, true);
+        assert!(textarea.line_selection_start.is_none());
+
+        textarea.start_line_selection();
+        textarea.move_cursor_with_shift(CursorMove::WordForward, false);
+        assert!(textarea.line_selection_start.is_none());
+
+        textarea.start_line_selection();
+        textarea.move_cursor_with_shift(CursorMove::End, false);
+        assert!(textarea.line_selection_start.is_none());
+    }
+
+    #[test]
+    fn vertical_movement_starts_line_selection_with_shift() {
+        let mut textarea = TextArea::from(["line1", "line2", "line3", "line4"]);
+
+        // Move to line 1
+        textarea.move_cursor(CursorMove::Down);
+        assert_eq!(textarea.cursor(), (1, 0));
+        assert!(textarea.line_selection_start.is_none());
+
+        // Vertical movement with shift should start line selection
+        textarea.move_cursor_with_shift(CursorMove::Down, true);
+        assert_eq!(textarea.cursor(), (2, 0));
+        assert!(textarea.line_selection_start.is_some());
+        assert_eq!(textarea.line_selection_start, Some(1));
+
+        // Reset and test other vertical movements
+        textarea.cancel_selection();
+        textarea.move_cursor_with_shift(CursorMove::Up, true);
+        assert!(textarea.line_selection_start.is_some());
+
+        textarea.cancel_selection();
+        textarea.move_cursor_with_shift(CursorMove::Top, true);
+        assert!(textarea.line_selection_start.is_some());
+
+        textarea.cancel_selection();
+        textarea.move_cursor_with_shift(CursorMove::Bottom, true);
+        assert!(textarea.line_selection_start.is_some());
+    }
+
+    #[test]
+    fn horizontal_movement_starts_character_selection_with_shift() {
+        let mut textarea = TextArea::from(["hello world", "second line"]);
+
+        // Horizontal movement with shift should start character selection, not line selection
+        textarea.move_cursor_with_shift(CursorMove::Forward, true);
+        assert!(textarea.selection_start.is_some());
+        assert!(textarea.line_selection_start.is_none());
+
+        // Reset and test other horizontal movements
+        textarea.cancel_selection();
+        textarea.move_cursor_with_shift(CursorMove::WordForward, true);
+        assert!(textarea.selection_start.is_some());
+        assert!(textarea.line_selection_start.is_none());
+
+        textarea.cancel_selection();
+        textarea.move_cursor_with_shift(CursorMove::End, true);
+        assert!(textarea.selection_start.is_some());
+        assert!(textarea.line_selection_start.is_none());
     }
 }

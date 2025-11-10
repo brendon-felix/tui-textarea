@@ -76,6 +76,8 @@ pub enum CursorMove {
     /// textarea.move_cursor(CursorMove::Head);
     /// assert_eq!(textarea.cursor(), (0, 0));
     /// ```
+    Left,
+    Right,
     Head,
     /// Move cursor to the end of line. When the cursor is at the end of line, it moves to the head of next line.
     /// ```
@@ -257,6 +259,10 @@ pub enum CursorMove {
     InViewport,
 }
 
+pub fn fit_col(col: usize, line: &str) -> usize {
+    cmp::min(col, line.chars().count())
+}
+
 impl CursorMove {
     pub(crate) fn next_cursor(
         &self,
@@ -265,10 +271,6 @@ impl CursorMove {
         viewport: &Viewport,
     ) -> Option<(usize, usize)> {
         use CursorMove::*;
-
-        fn fit_col(col: usize, line: &str) -> usize {
-            cmp::min(col, line.chars().count())
-        }
 
         match self {
             Forward if col >= lines[row].chars().count() => {
@@ -285,6 +287,10 @@ impl CursorMove {
                 Some((row, fit_col(col, &lines[row])))
             }
             Down => Some((row + 1, fit_col(col, lines.get(row + 1)?))),
+            Left if col == 0 => None,
+            Left => Some((row, col - 1)),
+            Right if col >= lines[row].chars().count() => None,
+            Right => Some((row, col + 1)),
             Head => Some((row, 0)),
             End => Some((row, lines[row].chars().count())),
             Top => Some((0, fit_col(col, &lines[0]))),
