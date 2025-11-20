@@ -237,6 +237,15 @@ impl<'a> TextArea<'a> {
         }
     }
 
+    pub fn reset_with_content<S: AsRef<str>>(&mut self, content: S) {
+        let cursor = self.cursor();
+        self.select_all();
+        self.delete_selection(false);
+        self.insert_str(content);
+        self.move_cursor(CursorMove::Jump(cursor.0 as u16, cursor.1 as u16));
+        self.history = History::new(50);
+    }
+
     /// Handle a key input with default key mappings. For default key mappings, see the table in
     /// [the module document](./index.html).
     /// `crossterm`, `termion`, and `termwiz` features enable conversion from their own key event types into
